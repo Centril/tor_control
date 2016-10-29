@@ -1,0 +1,13 @@
+[package]
+name    = "tor_control"
+version = "0.1.0"
+authors = ["Mazdak Farrokhzad <twingoow@gmail.com>"]
+license = "MIT/Apache-2.0"
+repository  = "https://github.com/Centril/tor_control"
+description = """
+Interface to the Tor Control Protocol (TorCP) as specified in
+https://gitweb.torproject.org/torspec.git/tree/control-spec.txt
+"""
+
+[dependencies]
+bufstream = "0.1"
