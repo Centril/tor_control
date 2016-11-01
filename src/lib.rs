@@ -38,18 +38,6 @@ use std::convert::{TryFrom, TryInto};
 use std::error::Error;
 
 //============================================================================//
-// Structs:                                                                   //
-//============================================================================//
-
-/// TorControl data structure.
-/// Holds a `BufStream` to a stream `T`, which is often a `TcpStream`.
-/// In addition, it records if TorCP is authenticated or not.
-pub struct TorControl<T: Read + Write> {
-    stream:  BufStream<T>,
-    is_auth: bool,
-}
-
-//============================================================================//
 // Errors:                                                                    //
 //============================================================================//
 
@@ -85,7 +73,8 @@ pub enum TCError {
     TorError(TCErrorKind)
 }
 
-/// The type of `Result` that the interface deals with. `E = TCError`.
+/// The type of `Result` that the interface deals with. [E = `TCError`].
+/// [E = `TCError`]: enum.TCError.html
 pub type TCResult<X> = Result<X, TCError>;
 
 use self::TCErrorKind::*;
@@ -191,6 +180,49 @@ impl From<u32> for TCError {
 }
 
 //============================================================================//
+// Structs:                                                                   //
+//============================================================================//
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::mpsc::{channel, Receiver, Sender, SendError};
+
+pub type Event = u32;
+
+/// Used for `SETEVENTS` (see: `3.4`, `4.1`).
+///
+/// It consists of two parts:
+///
+/// - `evt_tx`: The [`Sender`] half of the channel used by [`setevents`].
+///   This is protected by a mutex ensuring, that when a sync command is being
+///   sent, the all replies (both async and sync) are handled by the method
+///   that sent it, and not the async-replies handler thread.
+///   To ensure this, the lock is held by such methods from before the command
+///   is sent and until the last sync command is received.
+///
+/// - `close`: A close switch for the async-replies handler thread. Changing to
+///   `true` closes the thread. This is only used internally in [`setevents`].
+///
+/// [`setevents`]: struct.TorControl.html#method.setevents
+/// [`Sender`]: https://doc.rust-lang.org/std/sync/mpsc/struct.Sender.html
+pub struct AsyncState {
+    evt_tx: Mutex<Sender<Event>>,
+    close:  Arc<AtomicBool>
+}
+
+/// TorControl data structure.
+/// Holds a `BufStream` to a stream `T`, which is often a `TcpStream`.
+/// In addition, it records if TorCP is authenticated or not.
+pub struct TorControl<T: Read + Write> {
+    /// The buffered stream used to communicate with TorCP.
+    stream:  BufStream<T>,
+    /// Records if we've authenticated with TorCP yet.
+    is_auth: bool,
+    /// The transmitter half for async events (4.1, and enabled by 3.4).
+    asyncs:  Option<AsyncState>
+}
+
+//============================================================================//
 // Internal / Macros:                                                         //
 //============================================================================//
 
@@ -226,37 +258,73 @@ fn str_to_u32<S: AsRef<str>>(s: S) -> TCResult<u32> {
     s.as_ref().parse().map_err(|_| UnknownResponse)
 }
 
-/// Converts a byte string to u32, or fails with `UnknownResponse`.
-fn bytes_to_u32<B: AsRef<[u8]>>(b: B) -> TCResult<u32> {
-    str::from_utf8(b.as_ref()).map_err(|_| UnknownResponse).and_then(str_to_u32)
+fn read_status<S: AsRef<str>>(line: S) -> TCResult<u32> {
+    str_to_u32(&line.as_ref()[0 .. 3])
 }
 
-/// Trims all whitespace to the right of an owned `String`.
-fn trim_right(s: &mut String) {
-    let len = s.trim_right().len();
-    s.truncate(len);
+fn read_is_end<S: AsRef<str>>(line: S) -> TCResult<bool> {
+    // Act upon separator:
+    match &line.as_ref()[3 .. 4] {
+        // Meaning: this is the last line to read.
+        " "       => Ok(true),
+        // We have more lines to read.
+        "+" | "-" => Ok(false),
+        _         => Err(UnknownResponse)
+    }
 }
 
 //============================================================================//
 // Internal / Helper methods                                                  //
 //============================================================================//
 
-impl<T> TorControl<T> where T: Read + Write {
-    /// Executes a command that requires authentication and fails or
-    /// responds with status code 250.
-    fn authreq_command(&mut self, sig: &[u8]) -> TCResult<()> {
-        try!(self.req_auth());
-        try_wend!(self.stream, sig);
-        self.read_ok()
+/// A guard for the sender, either its a real `MutexGuard`, or a fake.
+type SenderGuard<'a> = Option<MutexGuard<'a, Sender<Event>>>;
+
+/// `Event Sender` trait, to satisfy compiler.
+trait ESend {
+    fn send(&self, t: Event) -> Result<(), SendError<Event>>;
+}
+
+/// See `ESend`.
+impl<'a> ESend for SenderGuard<'a> {
+    fn send(&self, t: Event) -> Result<(), SendError<Event>> {
+        match self {
+            &None => Ok(()),
+            &Some(ref real) => (*real).send(t)
+        }
+    }
+}
+
+fn handle_async<M: AsRef<str>>(sender: &SenderGuard, msg: M) -> TCResult<()> {
+    unimplemented!();
+}
+
+struct TCLock<'a, T: 'a + Read + Write> {
+    is_auth: &'a mut bool,
+    stream:  &'a mut BufStream<T>,
+    sender:  SenderGuard<'a>
+}
+
+impl<'a, T: Read + Write> TCLock<'a, T> {
+    fn read_line<'b>(&mut self, buf: &'b mut String)
+        -> TCResult<(u32, bool, &'b str)> {
+        // Read a line and make sure we have at least 3 (status) + 1 (sep) bytes.
+        if try!(self.stream.read_line(buf)) < 4 {
+            return Err(UnknownResponse)
+        }
+        let (buf_s, msg) = buf.split_at(4);
+        let status       = try!(read_status(&buf_s));
+        let is_end       = try!(read_is_end(&buf_s));
+        Ok((status, is_end, msg))
     }
 
     /// Handles a status code, 250 or 251 is Ok, otherwise error.
-    fn handle_code(&mut self, code: u32) -> TCResult<()> {
-        match code {
+    fn handle_code(&mut self, status: u32) -> TCResult<()> {
+        match status {
             250 | 251 => Ok(()),
-            code      => match code.into() {
+            status    => match status.into() {
                 TorError(AuthRequired) => {
-                    self.is_auth = false;
+                    *self.is_auth = false;
                     Err(TorError(AuthRequired))
                 },
                 e                      => Err(e)
@@ -266,80 +334,99 @@ impl<T> TorControl<T> where T: Read + Write {
 
     /// Reads a status code, if `250` -> `Ok(())`, otherwise -> error.
     fn read_ok(&mut self) -> TCResult<()> {
-        let code = try!(self.read_response());
-        self.handle_code(code)
-    }
-
-    /// Reads a status code.
-    fn read_response(&mut self) -> TCResult<u32> {
-        let mut status = String::new();
-        try!(self.stream.read_line(&mut status));
-        if status.len() > 2 {
-            str_to_u32(&status[0 .. 3])
-        } else {
-            Err(UnknownResponse)
+        let mut buf = String::new();
+        loop {
+            {
+                let (status, end, msg) = try!(self.read_line(&mut buf));
+                if status == 650 {
+                    try!(handle_async(&self.sender, msg));
+                } else if !end {
+                    return Err(UnknownResponse);
+                } else {
+                    return self.handle_code(status);
+                }
+            }
+            buf.clear();
         }
-    }
-
-    /// If internal state is recorded as not auth, an error is "thrown".
-    fn req_auth(&self) -> TCResult<()> {
-        if self.is_auth { Ok(()) } else { Err(TorError(AuthRequired)) }
-    }
-
-    fn read_add_trimmed(&mut self, rls: &mut Vec<String>) -> TCResult<()> {
-        let mut line = String::new();
-        try!(self.stream.read_line(&mut line));
-        trim_right(&mut line);
-        rls.push(line);
-        Ok(())
     }
 
     /// Reads one or many reply lines as specified in `2.3`.
     /// Terminates early on status code other than `250`.
     fn read_reply_lines(&mut self) -> TCResult<Vec<String>> {
-        let mut rls = Vec::with_capacity(1);
-
+        let mut rls: Vec<String> = Vec::with_capacity(1);
+        let mut buf = String::new();
         loop {
-            // Read status code and handle it:
-            let mut vcode = [0; 3];
-            try!(self.stream.read_exact(&mut vcode));
-            let code = try!(bytes_to_u32(vcode));
-            try!(self.handle_code(code));
-
-            /// Read separator:
-            let mut sep = [0; 1];
-            try!(self.stream.read_exact(&mut sep));
-
-            // Act upon separator:
-            match &sep {
-                // Meaning: this is the last line to read.
-                b" "        => {
-                    try!(self.read_add_trimmed(&mut rls));
-                    break;
-                },
-                // We have more lines to read.
-                b"+" | b"-" => try!(self.read_add_trimmed(&mut rls)),
-                _           => return Err(UnknownResponse)
+            {
+                let (status, end, msg) = try!(self.read_line(&mut buf));
+                if status == 650 {
+                    try!(handle_async(&self.sender, msg));
+                } else {
+                    try!(self.handle_code(status));
+                    rls.push(msg.trim_right().to_owned());
+                    if end {
+                        break;
+                    }
+                }
             }
+            buf.clear();
         }
 
         Ok(rls)
     }
+}
+
+impl<T> TorControl<T> where T: Read + Write {
+    /// If internal state is recorded as not auth, an error is "thrown".
+    fn req_auth(&self) -> TCResult<()> {
+        if self.is_auth {
+            Ok(())
+        } else {
+            Err(TorError(AuthRequired))
+        }
+    }
+
+    fn lock_tx(&mut self) -> TCLock<T> {
+        TCLock {
+            is_auth: &mut self.is_auth,
+            stream:  &mut self.stream,
+            sender:  match self.asyncs {
+                None => None,
+                Some(AsyncState { ref evt_tx, .. }) => Some(evt_tx.lock().unwrap())
+            }
+        }
+    }
+
+    /// Executes a command that requires authentication and fails or
+    /// responds with status code 250.
+    fn authreq_command(&mut self, sig: &[u8]) -> TCResult<()> {
+        try!(self.req_auth());
+        let mut tclock = self.lock_tx();
+        try_wend!(tclock.stream, sig);
+        tclock.read_ok()
+    }
+
+    fn write_many<I, Is>(&mut self, items: Is) -> TCResult<()>
+        where I:  AsRef<[u8]>,
+              Is: IntoIterator<Item = I> {
+        for item in items.into_iter() {
+            try_write!(self.stream, b" ", item.as_ref());
+        }
+        Ok(())
+    }
 
     /// Used for `setconf` and `resetconf`.
-    fn xsetconf<P>(&mut self, cmd: &[u8],
-        kw: P, val: Option<P>) -> TCResult<()>
+    fn xsetconf<P>(&mut self, cmd: &[u8], kw: P, val: Option<P>) -> TCResult<()>
         where P: AsRef<[u8]> {
-
         try!(self.req_auth());
 
         try_wend!(self.stream, cmd, b" ", kw.as_ref());
         if let Some(value) = val {
             try_write!(self.stream, b" = ", value.as_ref());
         }
-        try_wend!(self.stream);
 
-        self.read_ok()
+        let mut tclock = self.lock_tx();
+        try_wend!(tclock.stream);
+        tclock.read_ok()
     }
 }
 
@@ -363,7 +450,8 @@ impl<T> TorControl<T> where T: Read + Write {
     pub fn new(stream: T) -> Self {
         TorControl {
             stream:  BufStream::new(stream),
-            is_auth: false
+            is_auth: false,
+            asyncs:  None,
         }
     }
 
@@ -381,13 +469,18 @@ impl<T> TorControl<T> where T: Read + Write {
             return Ok(())
         }
 
-        if let Some(pass) = mpass {
-            try_wend!(self.stream, b"AUTHENTICATE ", pass.as_ref());
-        } else {
-            try_wend!(self.stream, b"AUTHENTICATE");
+        {
+            let mut tclock = self.lock_tx();
+
+            if let Some(pass) = mpass {
+                try_wend!(tclock.stream, b"AUTHENTICATE ", pass.as_ref());
+            } else {
+                try_wend!(tclock.stream, b"AUTHENTICATE");
+            }
+
+            try!(tclock.read_ok());
         }
 
-        try!(self.read_ok());
         self.is_auth = true;
         Ok(())
     }
@@ -445,7 +538,7 @@ impl<T> TorControl<T> where T: Read + Write {
     /// ["SocksPolicy=accept 127.0.0.1", "SocksPolicy=reject *", "Nickname"]
     /// ```
     pub fn getconf<P, Ks>(&mut self, kws: Ks) -> TCResult<Vec<String>>
-        where P: AsRef<[u8]>,
+        where P:  AsRef<[u8]>,
               Ks: IntoIterator<Item = P> {
         // Format is:
         // "GETCONF" 1*(SP keyword) CRLF
@@ -455,13 +548,72 @@ impl<T> TorControl<T> where T: Read + Write {
         try_write!(self.stream, b"GETCONF");
 
         // Write all keywords to get for:
-        for kw in kws.into_iter() {
-            try_write!(self.stream, b" ", kw.as_ref());
-        }
-        try_wend!(self.stream);
+        try!(self.write_many(kws));
+
+        let mut tclock = self.lock_tx();
+        try_wend!(tclock.stream);
 
         // Read all reply lines:
-        self.read_reply_lines()
+        tclock.read_reply_lines()
+    }
+
+    pub fn setevents<E, Es>(&mut self, extended: bool, events: Es)
+        -> TCResult<Receiver<Event>>
+        where E:  AsRef<[u8]>,
+              Es: IntoIterator<Item = E> {
+        // Format is:
+        // "SETEVENTS" [SP "EXTENDED"] *(SP EventCode) CRLF
+        // EventCode = 1*(ALPHA / "_")
+        try!(self.req_auth());
+
+        // Write the command:
+        try_write!(self.stream, b"SETEVENTS");
+
+        // Extended mode or not?
+        if extended {
+            try_write!(self.stream, b" EXTENDED");
+        }
+
+        // Write all keywords to get for:
+        try!(self.write_many(events));
+
+        {
+            let mut tclock = self.lock_tx();
+            try_wend!(tclock.stream);
+
+            // Are we Ok?
+            try!(tclock.read_ok());
+        }
+
+        // Destroy sender + old thread:
+        if let Some(ref xyz) = self.asyncs {
+            xyz.close.store(true, Ordering::Relaxed);
+        }
+        self.asyncs  = None;
+
+        // Create receiver, Create & save sender:
+        let (tx, rx) = channel();
+        let txx      = Mutex::new(tx.clone());
+        let close    = Arc::new(AtomicBool::new(false));
+
+        self.asyncs  = Some(AsyncState {
+            evt_tx: txx,
+            close:  close.clone()
+        });
+
+        // Spawn thread for async messages:
+        std::thread::spawn(move || {
+            loop {
+                if close.load(Ordering::Relaxed) {
+                    break;
+                }
+                // stuff
+                let t = 1;
+                let _ = tx.send(t);
+            }
+        });
+
+        Ok(rx)
     }
 
     /// Gets a configuration as specified in `3.3. GETCONF`.
@@ -523,8 +675,6 @@ impl<T> TorControl<T> where T: Read + Write {
     pub fn saveconf(&mut self) -> TCResult<()> {
         self.authreq_command(b"SAVECONF")
     }
-
-    //pub fn setevents(&mut self, extended: bool, ) -> 
 
     /// Issues a `NEWNYM` signal as specified in `3.7. SIGNAL`.
     pub fn newnym(&mut self) -> TCResult<()> {
