@@ -234,13 +234,10 @@ where W:  Write,
 // Internal / Reading utilities                                               //
 //============================================================================//
 
-/// Converts a "string" to a u32, or fails with `UnknownResponse`.
-fn str_to_u32<S: AsRef<str>>(s: S) -> TCResult<u32> {
-    s.as_ref().parse().map_err(|_| TCError::UnknownResponse)
-}
-
-fn read_status<S: AsRef<str>>(line: S) -> TCResult<u32> {
-    str_to_u32(&line.as_ref()[0 .. 3])
+use std::num::ParseIntError;
+/// Converts a "string" to a status code, or fails with `UnknownResponse`.
+fn read_status<S: AsRef<str>>(line: S) -> Result<u32, ParseIntError> {
+    (&line.as_ref()[0 .. 3]).parse()
 }
 
 fn read_is_end<S: AsRef<str>>(line: S) -> TCResult<bool> {
@@ -261,7 +258,7 @@ fn read_line<'b, R: BufRead>(stream: &mut R, buf: &'b mut String)
         return Err(UnknownResponse)
     }
     let (buf_s, msg) = buf.split_at(4);
-    let status       = try!(read_status(&buf_s));
+    let status       = try!(read_status(&buf_s).map_err(|_| TCError::UnknownResponse));
     let is_end       = try!(read_is_end(&buf_s));
     Ok((status, is_end, msg))
 }
@@ -665,8 +662,11 @@ impl<T: Read + Write> TorControl for TCAuth<T> {
 
 pub type Event = String;
 
-pub struct Poll<T: Read + Write> {
-    reader:  BufReader<T>,
+use std::sync::Mutex;
+use std::sync::Arc;
+
+pub struct TCEvents<T: Read + Write> {
+    reader:  Arc<Mutex<Option<BufReader<T>>>>,
     sync_tx: Sender<(u32, bool, String)>
 }
 
@@ -679,7 +679,8 @@ impl<T: Read + Write + TryClone + Debug> TCAuth<T> {
     /// and sends them to you by a returned receiver. This thread will run until
     /// you call this again with no events to subscribe to. In that case, no
     /// receiver is returned.
-    pub fn setevents<E, Es>(self, extended: bool, events: Es) -> TCResult<(TCAsync<T>, Poll<T>)>
+    pub fn setevents<E, Es>(self, extended: bool, events: Es)
+       -> TCResult<(TCAsync<T>, TCEvents<T>)>
     where E:  AsRef<[u8]>,
           Es: IntoIterator<Item = E> {
         // Format is:
@@ -706,35 +707,73 @@ impl<T: Read + Write + TryClone + Debug> TCAuth<T> {
 
         // Channel for communication between Async & Sync:
         let (sync_tx, sync_rx) = channel();
+
+        let reader  = Arc::new(Mutex::new(Some(BufReader::new(reader))));
+
         Ok((
             TCAsync {
                 writer:  BufWriter::new(writer),
-                sync_rx: sync_rx
+                sync_rx: sync_rx,
+                reader:  reader.clone(),
             },
-            Poll {
-                reader:  BufReader::new(reader),
+            TCEvents {
+                reader:  reader,
                 sync_tx: sync_tx
             }
         ))
     }
 }
 
-impl<T: Read + Write> Poll<T> {
-    pub fn poll(&mut self) -> TCResult<Option<String>> {
-        let mut buf = String::new();
-        let (status, end, msg) = try!(read_line(&mut self.reader, &mut buf));
 
-        if status == 650 {
-            Ok(Some(msg.to_owned()))
-        } else {
-            try!(self.sync_tx.send((status, end, msg.to_owned())));
-            Ok(None)
+
+
+
+pub enum Async<T> {
+    Ready(T),
+    NotReady,
+}
+
+type Poll<T, E> = Result<Async<T>, E>;
+
+trait Stream {
+    type Item;
+    type Error;
+
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error>;
+}
+
+use std::ops::DerefMut;
+
+enum EErr {
+
+}
+
+impl<T: Read + Write> Stream for TCEvents<T> {
+    type Item  = String;
+    type Error = EErr;
+
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        let mut buf = String::new();
+
+        let mut guard = try!(self.reader.lock());
+        match guard.deref_mut() {
+            &mut None => Ok(Async::Ready(None)),
+            &mut Some(ref mut reader) => {
+                let (status, end, msg) = try!(read_line(reader, &mut buf));
+
+                if status == 650 {
+                    Ok(Async::Ready(Some(msg.to_owned())))
+                } else {
+                    try!(self.sync_tx.send((status, end, msg.to_owned())));
+                    Ok(Async::NotReady)
+                }
+            },
         }
     }
 }
 
 impl<T: Read + Write + Debug> TCAsync<T> {
-    pub fn stopevents(mut self) -> TCResult<TCAuth<T>> {
+    fn stopevents(mut self) -> TCResult<TCAuth<T>> {
         try_wend!(self.writer(), b"SETEVENTS");
         try!(self.read_ok());
 
@@ -750,7 +789,8 @@ impl<T: Read + Write + Debug> TCAsync<T> {
 
 pub struct TCAsync<T: Read + Write> {
     writer:  BufWriter<T>,
-    sync_rx: Receiver<(u32, bool, String)>
+    sync_rx: Receiver<(u32, bool, String)>,
+    reader:  Arc<Mutex<Option<BufReader<T>>>>
 }
 
 impl<T: Read + Write> IsAuth for TCAsync<T> {
