@@ -23,8 +23,6 @@
 
 #![feature(try_from)]
 
-#![feature(specialization)]
-
 // Standard Library:
 use std::iter;
 
@@ -44,6 +42,9 @@ use std::ops::DerefMut;
 extern crate bufstream;
 use bufstream::BufStream;
 
+extern crate futures;
+use futures::{Async, Poll, Stream};
+
 //============================================================================//
 // Errors:                                                                    //
 //============================================================================//
@@ -60,33 +61,58 @@ fn description_unknown() -> &'static str {
     "Tor Control replied with unknown response"
 }
 
+macro_rules! impl_err_base {
+    ($typ: ident) => {
+        impl TCErrBase for $typ {
+            fn unknown_error() -> Self {
+                $typ::UnknownResponse
+            }
+        }
+
+        impl From<io::Error> for $typ {
+            fn from(err: io::Error) -> Self {
+                $typ::IoError(err)
+            }
+        }
+
+        impl Display for $typ {
+            fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+                Debug::fmt(self, f)
+            }
+        }
+    };
+}
+
+macro_rules! impl_err_statused {
+    ($typ: ident) => {
+        impl_err_base!($typ);
+        impl TCStatusedError for $typ {}
+        impl From<u32> for $typ {
+            fn from(err: u32) -> Self {
+                use $typ::*;
+                err.try_into().map(TorError).unwrap_or(UnknownResponse)
+            }
+        }
+    };
+}
+
 //============================================================================//
 // Errors / TCEventsError:                                                    //
 //============================================================================//
 
-type AsyncNotify = (u32, bool, String);
+type AsyncNotify  = (u32, bool, String);
 type OptReader<T> = Option<BufReader<T>>;
 type PEOptReader<'a, T> = PoisonError<MutexGuard<'a, OptReader<T>>>;
 
 #[derive(Debug)]
-enum TCEventsError {
+pub enum TCEventsError {
     UnknownResponse,
     IoError(io::Error),
     SendError(mpsc::SendError<AsyncNotify>),
     PoisonError,
 }
 
-impl TCErrBase for TCEventsError {
-    fn unknown_error() -> Self {
-        TCEventsError::UnknownResponse
-    }
-}
-
-impl From<io::Error> for TCEventsError {
-    fn from(err: io::Error) -> Self {
-        TCEventsError::IoError(err)
-    }
-}
+impl_err_base!(TCEventsError);
 
 impl From<mpsc::SendError<AsyncNotify>> for TCEventsError {
     fn from(err: mpsc::SendError<AsyncNotify>) -> Self {
@@ -174,7 +200,7 @@ impl TryFrom<u32> for TCErrorKind {
     }
 }
 
-fn description_kind<'a>(kind: &'a TCErrorKind) -> &'a str {
+fn description_kind(kind: &TCErrorKind) -> &str {
     use TCErrorKind::*;
     match *kind {
         ResourceExhausted   => "Tor Control: Resource exhausted",
@@ -210,33 +236,7 @@ pub enum TCError {
     TorError(TCErrorKind)
 }
 
-impl TCErrBase for TCError {
-    fn unknown_error() -> Self {
-        TCError::UnknownResponse
-    }
-}
-
-impl From<io::Error> for TCError {
-    fn from(err: io::Error) -> Self {
-        TCError::IoError(err)
-    }
-}
-
-impl TCStatusedError for TCError {}
-
-impl From<u32> for TCError {
-    fn from(err: u32) -> Self {
-        use TCError::*;
-        err.try_into().map(TorError).unwrap_or(UnknownResponse)
-    }
-}
-
-/// `Display` for `TCError` simply uses `Debug`.
-impl Display for TCError {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        Debug::fmt(self, f)
-    }
-}
+impl_err_statused!(TCError);
 
 impl Error for TCError {
     fn description(&self) -> &str {
@@ -268,26 +268,7 @@ pub enum TCAsyncError {
     RecvError(RecvError),
 }
 
-impl TCErrBase for TCAsyncError {
-    fn unknown_error() -> Self {
-        TCAsyncError::UnknownResponse
-    }
-}
-
-impl From<io::Error> for TCAsyncError {
-    fn from(err: io::Error) -> Self {
-        TCAsyncError::IoError(err)
-    }
-}
-
-impl TCStatusedError for TCAsyncError {}
-
-impl From<u32> for TCAsyncError {
-    fn from(err: u32) -> Self {
-        use TCAsyncError::*;
-        err.try_into().map(TorError).unwrap_or(UnknownResponse)
-    }
-}
+impl_err_statused!(TCAsyncError);
 
 impl<'a, T> From<PEOptReader<'a, T>> for TCAsyncError {
     fn from(_: PEOptReader<'a, T>) -> Self {
@@ -299,12 +280,6 @@ impl From<RecvError> for TCAsyncError {
     fn from(err: RecvError) -> Self {
         use TCAsyncError::*;
         RecvError(err)
-    }
-}
-
-impl Display for TCAsyncError {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        Debug::fmt(self, f)
     }
 }
 
@@ -337,22 +312,20 @@ impl Error for TCAsyncError {
 /// Does a bunch of `write_all(...)` on a Write.
 macro_rules! try_write {
     ( $s:expr, $( $x:expr ),* ) => {
-        $( try!($s.write_all( $x )); )*
+        $( $s.write_all( $x )?; )*
     };
 }
 
 /// Writes end of line and flushes on a Write.
-fn write_end<W, E>(w: &mut W) -> Result<(), E>
-where W: Write,
-      E: TCErrBase {
+fn write_end<W: Write, E: TCErrBase>(w: &mut W) -> Result<(), E> {
     try_write!(w, b"\r\n");
-    try!(w.flush());
+    w.flush()?;
     Ok(())
 }
 
 /// Combines `try_write!(...)` and `write_end` on a Write.
 macro_rules! try_wend {
-    ( $w:ty, $e:ty, $s:expr ) => { try!(write_end::<$w, $e>(&mut $s)) };
+    ( $w:ty, $e:ty, $s:expr ) => { write_end::<$w, $e>(&mut $s)? };
     ( $w:ty, $e:ty, $s:expr, $( $x:expr ),* ) => {
         try_write!( $s, $($x),* );
         try_wend!( $w, $e, $s );
@@ -360,7 +333,7 @@ macro_rules! try_wend {
 }
 
 macro_rules! try_wendtc {
-    ( $s:expr ) => { try!(write_end::<Self::Writer, Self::Error>(&mut $s)) };
+    ( $s:expr ) => { write_end::<Self::Writer, Self::Error>(&mut $s)? };
     ( $s:expr, $( $x:expr ),* ) => {
         try_write!( $s, $($x),* );
         try_wendtc!( $s );
@@ -368,10 +341,10 @@ macro_rules! try_wendtc {
 }
 
 /// Writes an iterator of byte arrays to the stream, separated by whitespace.
-fn write_many<W, I, Is, E>(writer: &mut W, items: Is) -> Result<usize, E>
+fn write_many<W, Is, E>(writer: &mut W, items: Is) -> Result<usize, E>
 where W:  Write,
-      I:  AsRef<[u8]>,
-      Is: IntoIterator<Item = I>,
+      Is: IntoIterator,
+      Is::Item: AsRef<[u8]>,
       E:  TCErrBase {
     let mut c = 0;
     for item in items.into_iter() {
@@ -401,17 +374,15 @@ fn read_is_end<E: TCErrBase>(line: &str) -> Result<bool, E> {
     }
 }
 
-fn read_line<'b, R, E>(stream: &mut R, buf: &'b mut String)
-      -> Result<(u32, bool, &'b str), E>
-where R: BufRead,
-      E: TCErrBase {
+fn read_line<'b, R: BufRead, E: TCErrBase>(stream: &mut R, buf: &'b mut String)
+      -> Result<(u32, bool, &'b str), E> {
     // Read a line and make sure we have at least 3 (status) + 1 (sep) bytes.
-    if try!(stream.read_line(buf)) < 4 {
+    if stream.read_line(buf)? < 4 {
         return Err(E::unknown_error())
     }
     let (buf_s, msg) = buf.split_at(4);
-    let status       = try!(read_status::<E>(&buf_s));
-    let is_end       = try!(read_is_end::<E>(&buf_s));
+    let status       = read_status::<E>(&buf_s)?;
+    let is_end       = read_is_end::<E>(&buf_s)?;
     Ok((status, is_end, msg))
 }
 
@@ -424,11 +395,9 @@ fn handle_code<E: TCStatusedError>(status: u32) -> Result<(), E> {
 }
 
 /// Reads a status code, if `250` -> `Ok(())`, otherwise -> error.
-fn read_ok_sync<R, E>(read: &mut R) -> Result<(), E>
-where R: BufRead,
-      E: TCStatusedError {
+fn read_ok_sync<R: BufRead, E: TCStatusedError>(read: &mut R) -> Result<(), E> {
     let mut buf = String::new();
-    let (status, end, _) = try!(read_line::<R, E>(read, &mut buf));
+    let (status, end, _) = read_line::<R, E>(read, &mut buf)?;
     if end {
         handle_code(status)
     } else {
@@ -445,8 +414,8 @@ where R: BufRead,
     let mut buf = String::new();
     loop {
         {
-            let (status, end, msg) = try!(read_line::<R, E>(read, &mut buf));
-            try!(handle_code::<E>(status));
+            let (status, end, msg) = read_line::<R, E>(read, &mut buf)?;
+            handle_code::<E>(status)?;
             rls.push(msg.trim_right().to_owned());
             if end {
                 break;
@@ -485,11 +454,12 @@ pub trait IsAsync {
     fn is_async(&self) -> bool;
 }
 
-pub trait TorLimited {}
-
-pub trait TorControl {
+pub trait TorLimited {
     type Writer: Write;
     type Error: TCStatusedError;
+
+    #[doc(hidden)]
+    fn into_writer(self) -> Self::Writer;
 
     #[doc(hidden)]
     fn writer(&mut self) -> &mut Self::Writer;
@@ -502,6 +472,23 @@ pub trait TorControl {
     /// Terminates early on status code other than `250`.
     fn read_lines(&mut self) -> Result<Vec<String>, Self::Error>;
 
+    /// Tells the server to hang up on this controller connection as specified
+    /// in `3.18. QUIT`
+    fn quit(self) -> Result<(), Self::Error>
+        where Self: Sized {
+        let mut w = self.into_writer();
+        try_write!(w, b"QUIT");
+        write_end(&mut w)
+    }
+
+    // 3.21. PROTOCOLINFO
+    fn protocol_info(&mut self) -> Result<Vec<String>, Self::Error> {
+        try_wend!(Self::Writer, Self::Error, self.writer(), b"PROTOCOLINFO 1");
+        self.read_lines()
+    }
+}
+
+pub trait TorControl: TorLimited {
     #[doc(hidden)]
     /// Executes a simple "one-shot" command expecting a 250 OK reply back.
     fn command<P>(&mut self, cmd: P) -> Result<(), Self::Error>
@@ -584,9 +571,9 @@ pub trait TorControl {
     /// ```text
     /// ["SocksPolicy=accept 127.0.0.1", "SocksPolicy=reject *", "Nickname"]
     /// ```
-    fn getconf<P, Ks>(&mut self, kws: Ks) -> Result<Vec<String>, Self::Error>
-    where P:  AsRef<[u8]>,
-          Ks: IntoIterator<Item = P> {
+    fn getconf<Ks>(&mut self, kws: Ks) -> Result<Vec<String>, Self::Error>
+    where Ks: IntoIterator,
+          Ks::Item: AsRef<[u8]> {
         {
             // Format is:
             // "GETCONF" 1*(SP keyword) CRLF
@@ -595,7 +582,26 @@ pub trait TorControl {
             try_write!(writer, b"GETCONF");
 
             // Write all keywords to get for:
-            try!(write_many::<Self::Writer, P, Ks, Self::Error>(&mut writer, kws));
+            write_many::<Self::Writer, Ks, Self::Error>(&mut writer, kws)?;
+            try_wendtc!(writer);
+        }
+
+        self.read_lines()
+    }
+
+    /// Gets a configuration as specified in `3.9. GETINFO`.
+    fn getinfo<Ks>(&mut self, kws: Ks) -> Result<Vec<String>, Self::Error>
+    where Ks: IntoIterator,
+          Ks::Item: AsRef<[u8]> {
+        {
+            // Format is:
+            // "GETINFO" 1*(SP keyword) CRLF
+            // Write the command:
+            let mut writer = self.writer();
+            try_write!(writer, b"GETINFO");
+
+            // Write all keywords to get for:
+            write_many::<Self::Writer, Ks, Self::Error>(&mut writer, kws)?;
             try_wendtc!(writer);
         }
 
@@ -643,7 +649,7 @@ pub trait TorControl {
     fn getconf0<K>(&mut self, kw: K) -> Result<Option<Vec<String>>, Self::Error>
     where K: AsRef<[u8]> {
         // Read variables:
-        let lines = try!(self.getconf(iter::once(kw)));
+        let lines = self.getconf(iter::once(kw))?;
 
         // Strip everything before = in reply lines, and if it wasn't found,
         // indicate that we found the default value by returning None.
@@ -743,11 +749,32 @@ impl<T: Read + Write> IsAsync for TCNoAuth<T> {
     }
 }
 
+impl<T: Read + Write> TorLimited for TCNoAuth<T> {
+    type Writer = BufStream<T>;
+    type Error  = TCError;
+
+    fn into_writer(self) -> Self::Writer {
+        self.0
+    }
+
+    fn writer(&mut self) -> &mut Self::Writer {
+        &mut self.0
+    }
+
+    fn read_ok(&mut self) -> Result<(), TCError> {
+        read_ok_sync(&mut self.0)
+    }
+
+    fn read_lines(&mut self) -> Result<Vec<String>, TCError> {
+        read_lines_sync(&mut self.0)
+    }
+}
+
 impl<T> Connectable for TCNoAuth<T>
 where T: Connectable<Error = io::Error> + Read + Write {
     type Error = TCError;
     fn connect<A: ToSocketAddrs>(addr: A) -> Result<Self, Self::Error> {
-        Ok(TCNoAuth::new(try!(T::connect(addr))))
+        Ok(TCNoAuth::new(T::connect(addr)?))
     }
 }
 
@@ -771,7 +798,7 @@ impl<T: Read + Write> TCNoAuth<T> {
             try_wend!(BufStream<T>, TCError, stream, b"AUTHENTICATE");
         }
 
-        try!(read_ok_sync::<BufStream<T>, TCError>(&mut stream));
+        read_ok_sync::<BufStream<T>, TCError>(&mut stream)?;
 
         Ok(TCAuth(stream))
     }
@@ -795,9 +822,13 @@ impl<T: Read + Write> IsAsync for TCAuth<T> {
     }
 }
 
-impl<T: Read + Write> TorControl for TCAuth<T> {
+impl<T: Read + Write> TorLimited for TCAuth<T> {
     type Writer = BufStream<T>;
     type Error  = TCError;
+
+    fn into_writer(self) -> Self::Writer {
+        self.0
+    }
 
     fn writer(&mut self) -> &mut Self::Writer {
         &mut self.0
@@ -807,12 +838,12 @@ impl<T: Read + Write> TorControl for TCAuth<T> {
         read_ok_sync(&mut self.0)
     }
 
-    /// Reads one or many reply lines as specified in `2.3`.
-    /// Terminates early on status code other than `250`.
     fn read_lines(&mut self) -> Result<Vec<String>, TCError> {
         read_lines_sync(&mut self.0)
     }
 }
+
+impl<T: Read + Write> TorControl for TCAuth<T> {}
 
 //============================================================================//
 // SETEVENTS, 3.4                                                             //
@@ -820,9 +851,34 @@ impl<T: Read + Write> TorControl for TCAuth<T> {
 
 pub type Event = String;
 
+type StealableReader<T> = Arc<Mutex<OptReader<T>>>;
+
 pub struct TCEvents<T: Read + Write> {
-    reader:  Arc<Mutex<Option<BufReader<T>>>>,
-    sync_tx: Sender<(u32, bool, String)>
+    reader:  StealableReader<T>,
+    sync_tx: Sender<AsyncNotify>
+}
+
+fn setevents_common<Es, Err, W>(writer: &mut W, extended: bool, events: Es)
+       -> Result<(), Err>
+    where Es:  IntoIterator,
+          Es::Item: AsRef<[u8]>,
+          Err: TCErrBase,
+          W:   Write {
+        // Format is:
+        // "SETEVENTS" [SP "EXTENDED"] *(SP EventCode) CRLF
+        // EventCode = 1*(ALPHA / "_")
+
+        // Write the command:
+        try_write!(writer, b"SETEVENTS");
+
+        // Extended mode or not?
+        if extended {
+            try_write!(writer, b" EXTENDED");
+        }
+
+        // Subscribe to all events & check if we're OK:
+        write_many::<W, Es, Err>(writer, events)?;
+        write_end::<W, Err>(writer)
 }
 
 impl<T: Read + Write + TryClone + Debug> TCAuth<T> {
@@ -834,36 +890,23 @@ impl<T: Read + Write + TryClone + Debug> TCAuth<T> {
     /// and sends them to you by a returned receiver. This thread will run until
     /// you call this again with no events to subscribe to. In that case, no
     /// receiver is returned.
-    pub fn setevents<E, Es>(self, extended: bool, events: Es)
+    pub fn setevents<Es>(self, extended: bool, events: Es)
        -> Result<(TCAsync<T>, TCEvents<T>), TCError>
-    where E:  AsRef<[u8]>,
-          Es: IntoIterator<Item = E> {
-        // Format is:
-        // "SETEVENTS" [SP "EXTENDED"] *(SP EventCode) CRLF
-        // EventCode = 1*(ALPHA / "_")
+    where Es: IntoIterator,
+          Es::Item:  AsRef<[u8]> {
         let mut stream = self.0;
-
-        // Write the command:
-        try_write!(stream, b"SETEVENTS");
-
-        // Extended mode or not?
-        if extended {
-            try_write!(stream, b" EXTENDED");
-        }
-
-        // Subscribe to all events & check if we're OK:
-        try!(write_many::<BufStream<T>, E, Es, TCError>(&mut stream, events));
-        try_wend!(BufStream<T>, TCError, stream);
-        try!(read_ok_sync::<BufStream<T>, TCError>(&mut stream));
+        setevents_common::<Es, TCError, BufStream<T>>
+            (&mut stream, extended, events)?;
+        read_ok_sync::<BufStream<T>, TCError>(&mut stream)?;
 
         // Since we already flushed out the data, this should never happen:
         let reader = stream.into_inner().unwrap();
-        let writer = try!(reader.try_clone());
+        let writer = reader.try_clone()?;
 
         // Channel for communication between Async & Sync:
         let (sync_tx, sync_rx) = channel();
 
-        let reader  = Arc::new(Mutex::new(Some(BufReader::new(reader))));
+        let reader = Arc::new(Mutex::new(Some(BufReader::new(reader))));
 
         Ok((
             TCAsync {
@@ -879,22 +922,23 @@ impl<T: Read + Write + TryClone + Debug> TCAuth<T> {
     }
 }
 
-
-
-
-
-pub enum Async<T> {
-    Ready(T),
-    NotReady,
-}
-
-type Poll<T, E> = Result<Async<T>, E>;
-
-trait Stream {
-    type Item;
-    type Error;
-
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error>;
+impl<T: Read + Write + TryClone + Debug> TCAsync<T> {
+    /// 3.4. SETEVENTS Request the server to inform the client about interesting
+    /// events. See the TorCP documentation for specifics.
+    ///
+    /// Each event to subscribe to should be an element in the iterator.
+    /// A thread is spawned inside the function which handles the async events
+    /// and sends them to you by a returned receiver. This thread will run until
+    /// you call this again with no events to subscribe to. In that case, no
+    /// receiver is returned.
+    pub fn setevents<Es>(&mut self, extended: bool, events: Es)
+       -> Result<(), TCAsyncError>
+    where Es: IntoIterator,
+          Es::Item: AsRef<[u8]> {
+        setevents_common::<Es, TCAsyncError, BufWriter<T>>
+            (&mut self.writer, extended, events)?;
+        self.read_ok()
+    }
 }
 
 impl<T: Read + Write> Stream for TCEvents<T> {
@@ -902,20 +946,17 @@ impl<T: Read + Write> Stream for TCEvents<T> {
     type Error = TCEventsError;
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        let mut buf = String::new();
-
-        let mut guard = try!(self.reader.lock());
-        match guard.deref_mut() {
+        match self.reader.lock()?.deref_mut() {
             &mut None => Ok(Async::Ready(None)),
             &mut Some(ref mut reader) => {
+                let mut buf = String::new();
                 let (status, end, msg) =
-                    try!(read_line::<BufReader<T>, Self::Error>(
-                        reader, &mut buf));
+                    read_line::<BufReader<T>, Self::Error>(reader, &mut buf)?;
 
                 if status == 650 {
                     Ok(Async::Ready(Some(msg.to_owned())))
                 } else {
-                    try!(self.sync_tx.send((status, end, msg.to_owned())));
+                    self.sync_tx.send((status, end, msg.to_owned()))?;
                     Ok(Async::NotReady)
                 }
             },
@@ -923,17 +964,16 @@ impl<T: Read + Write> Stream for TCEvents<T> {
     }
 }
 
-impl<T: Read + Write + Debug> TCAsync<T> {
+impl<T: Read + Write> TCAsync<T> {
     pub fn stopevents(mut self) -> Result<TCAuth<T>, TCAsyncError> {
         try_wend!(BufWriter<T>, TCAsyncError, self.writer(), b"SETEVENTS");
-        try!(self.read_ok());
+        self.read_ok()?;
 
         let reader = {
             // We're going to steal back the reader:
-            let mut guard = try!(self.reader.lock());
-
             // Since this is the place that ever modifies this, this is fine.
-            std::mem::replace(guard.deref_mut(), None).unwrap().into_inner()
+            std::mem::replace(self.reader.lock()?.deref_mut(), None)
+                .unwrap().into_inner()
         };
 
         Ok(TCAuth(BufStream::new(reader)))
@@ -946,8 +986,8 @@ impl<T: Read + Write + Debug> TCAsync<T> {
 
 pub struct TCAsync<T: Read + Write> {
     writer:  BufWriter<T>,
-    sync_rx: Receiver<(u32, bool, String)>,
-    reader:  Arc<Mutex<Option<BufReader<T>>>>
+    sync_rx: Receiver<AsyncNotify>,
+    reader:  StealableReader<T>
 }
 
 impl<T: Read + Write> IsAuth for TCAsync<T> {
@@ -962,17 +1002,21 @@ impl<T: Read + Write> IsAsync for TCAsync<T> {
     }
 }
 
-impl<T: Read + Write> TorControl for TCAsync<T> {
+impl<T: Read + Write> TorLimited for TCAsync<T> {
     type Writer = BufWriter<T>;
     type Error  = TCAsyncError;
+
+    fn into_writer(self) -> Self::Writer {
+        self.writer
+    }
 
     fn writer(&mut self) -> &mut Self::Writer {
         &mut self.writer
     }
 
     fn read_ok(&mut self) -> Result<(), Self::Error> {
-        let (status, end, _) = try!(self.sync_rx.recv());
-        try!(handle_code::<TCAsyncError>(status));
+        let (status, end, _) = self.sync_rx.recv()?;
+        handle_code::<Self::Error>(status)?;
         if end {
             Ok(())
         } else {
@@ -980,13 +1024,11 @@ impl<T: Read + Write> TorControl for TCAsync<T> {
         }
     }
 
-    /// Reads one or many reply lines as specified in `2.3`.
-    /// Terminates early on status code other than `250`.
     fn read_lines(&mut self) -> Result<Vec<String>, Self::Error> {
-        let mut rls: Vec<String> = Vec::with_capacity(1);
+        let mut rls = Vec::with_capacity(1);
         loop {
-            let (status, end, msg) = try!(self.sync_rx.recv());
-            try!(handle_code::<TCAsyncError>(status));
+            let (status, end, msg) = self.sync_rx.recv()?;
+            handle_code::<Self::Error>(status)?;
             rls.push(msg.trim_right().to_owned());
             if end {
                 break;
@@ -995,3 +1037,5 @@ impl<T: Read + Write> TorControl for TCAsync<T> {
         Ok(rls)
     }
 }
+
+impl<T: Read + Write> TorControl for TCAsync<T> {}
