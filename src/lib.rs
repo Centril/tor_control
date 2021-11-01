@@ -20,7 +20,6 @@
 //============================================================================//
 // Imports + Features                                                         //
 //============================================================================//
-
 #![feature(try_from)]
 
 // Standard Library:
@@ -177,7 +176,7 @@ impl Into<u32> for TCErrorKind {
 /// Conversions from error codes into as specified in
 /// `4. Replies` in the TorCP specification.
 impl TryFrom<u32> for TCErrorKind {
-    type Err = ();
+    type Error = ();
     fn try_from(code: u32) -> Result<Self, ()> {
         use TCErrorKind::*;
         match code {
